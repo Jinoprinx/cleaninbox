@@ -1,4 +1,4 @@
-export type EmailLabel = 'SPAM' | 'IMPORTANT' | 'PROMOTIONAL';
+export type EmailLabel = 'Spam' | 'Important' | 'Ads';
 
 export interface Email {
   id: string;

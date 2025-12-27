@@ -12,7 +12,7 @@ interface EmailListProps {
 export function EmailList({ emails, processing, onLabelApply }: EmailListProps) {
   return (
     <div className="grid gap-4">
-      {emails.map((email) => (
+      {Array.isArray(emails) && emails.map((email) => (
         <EmailCard
           key={email.id}
           email={email}

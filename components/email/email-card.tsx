@@ -36,7 +36,7 @@ export function EmailCard({ email, processing, onLabelApply }: EmailCardProps) {
             variant="outline"
             size="sm"
             disabled={!!processing}
-            onClick={() => onLabelApply(email.id, 'SPAM')}
+            onClick={() => onLabelApply(email.id, 'Spam')}
           >
             {processing === email.id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -49,7 +49,7 @@ export function EmailCard({ email, processing, onLabelApply }: EmailCardProps) {
             variant="outline"
             size="sm"
             disabled={!!processing}
-            onClick={() => onLabelApply(email.id, 'IMPORTANT')}
+            onClick={() => onLabelApply(email.id, 'Important')}
           >
             {processing === email.id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
@@ -62,7 +62,7 @@ export function EmailCard({ email, processing, onLabelApply }: EmailCardProps) {
             variant="outline"
             size="sm"
             disabled={!!processing}
-            onClick={() => onLabelApply(email.id, 'PROMOTIONAL')}
+            onClick={() => onLabelApply(email.id, 'Ads')}
           >
             {processing === email.id ? (
               <Loader2 className="h-4 w-4 animate-spin" />
