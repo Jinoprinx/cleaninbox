@@ -1,6 +1,6 @@
 import { google } from 'googleapis';
 import { OAuth2Client } from 'google-auth-library';
-import type { Email, EmailLabel } from '@/types/email';
+import type { Email, EmailLabel, Subscription } from '@/types/email';
 
 export class GmailService {
   private oauth2Client: OAuth2Client;
@@ -159,19 +159,27 @@ export class GmailService {
   private async labelAllFromSender(gmail: any, sender: string, labelId: string) {
     let query = `from:${sender}`;
     let messages: any[] = [];
+    let pageToken: string | undefined = undefined;
 
-    let response = await gmail.users.messages.list({
-      userId: 'me',
-      q: query,
-      maxResults: 500
-    });
+    // Paginate through ALL emails from sender
+    do {
+      const response = await gmail.users.messages.list({
+        userId: 'me',
+        q: query,
+        maxResults: 500,
+        pageToken: pageToken
+      });
 
-    if (response.data.messages) {
-      messages = messages.concat(response.data.messages);
-    }
+      if (response.data.messages) {
+        messages = messages.concat(response.data.messages);
+      }
+
+      pageToken = response.data.nextPageToken;
+    } while (pageToken);
 
     if (messages.length === 0) return;
 
+    // Apply label in batches
     const batchSize = 1000;
     for (let i = 0; i < messages.length; i += batchSize) {
       const batch = messages.slice(i, i + batchSize).map((m: any) => m.id);
@@ -222,5 +230,276 @@ export class GmailService {
         }
       });
     }
+  }
+
+  async listSubscriptions(): Promise<Subscription[]> {
+    const gmail = this.getGmailClient();
+
+    // Search for emails with List-Unsubscribe header
+    // We'll scan a reasonable number of recent emails to find active subscriptions
+    const response = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 200, // Scan last 200 emails
+      q: 'list:(<mailto:> OR <http>)', // Heuristic to find list-unsubscribe
+    });
+
+    const messages = response.data.messages || [];
+    const subscriptionMap = new Map<string, Subscription>();
+
+    // Process concurrently
+    const chunkHelp = async (msg: any) => {
+      try {
+        const email = await gmail.users.messages.get({
+          userId: 'me',
+          id: msg.id!,
+          format: 'metadata',
+          metadataHeaders: ['From', 'List-Unsubscribe', 'Date', 'Subject'],
+        });
+
+        const headers = email.data.payload?.headers;
+        const listUnsubscribe = headers?.find((h) => h.name === 'List-Unsubscribe')?.value;
+        const from = headers?.find((h) => h.name === 'From')?.value || '';
+        const date = headers?.find((h) => h.name === 'Date')?.value || '';
+
+        if (listUnsubscribe && from) {
+          // Extract email address for uniqueness
+          const emailMatch = from.match(/<(.+)>/);
+          const senderEmail = emailMatch ? emailMatch[1] : from;
+
+          if (!subscriptionMap.has(senderEmail)) {
+            // Parse unsubscribe link/email
+            // Header format: <mailto:unsubscribe@example.com>, <https://example.com/unsubscribe>
+            const mailtoMatch = listUnsubscribe.match(/<mailto:([^>]+)>/);
+            const linkMatch = listUnsubscribe.match(/<(https?:\/\/[^>]+)>/);
+
+            subscriptionMap.set(senderEmail, {
+              id: msg.id!,
+              sender: from.split('<')[0].trim().replace(/"/g, ''), // Clean name
+              email: senderEmail,
+              lastEmailDate: date,
+              unsubscribeEmail: mailtoMatch ? mailtoMatch[1] : undefined,
+              unsubscribeLink: linkMatch ? linkMatch[1] : undefined,
+            });
+          }
+        }
+      } catch (e) {
+        // Ignore errors for individual messages
+      }
+    };
+
+    await Promise.all(messages.map(chunkHelp));
+    return Array.from(subscriptionMap.values());
+  }
+
+  async unsubscribe(subscription: Subscription): Promise<boolean> {
+    // Prioritize mailto (standard and reliable)
+    if (subscription.unsubscribeEmail) {
+      const gmail = this.getGmailClient();
+      const rawMessage = [
+        `To: ${subscription.unsubscribeEmail}`,
+        'Subject: Unsubscribe',
+        '',
+        'Please unsubscribe me from this list.'
+      ].join('\n');
+
+      const encodedMessage = Buffer.from(rawMessage).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+      await gmail.users.messages.send({
+        userId: 'me',
+        requestBody: {
+          raw: encodedMessage
+        }
+      });
+      return true;
+    }
+
+    return false;
+  }
+
+  async getSenderStats(): Promise<{ sender: string; email: string; count: number; }[]> {
+    const gmail = this.getGmailClient();
+
+    // Fetch a larger sample of recent emails for better analytics
+    const response = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 500,
+    });
+
+    const messages = response.data.messages || [];
+    const senderMap = new Map<string, { sender: string; count: number; }>();
+
+    // Process concurrently
+    const chunkHelp = async (msg: any) => {
+      try {
+        const email = await gmail.users.messages.get({
+          userId: 'me',
+          id: msg.id!,
+          format: 'metadata',
+          metadataHeaders: ['From'],
+        });
+
+        const headers = email.data.payload?.headers;
+        const from = headers?.find((h) => h.name === 'From')?.value || '';
+
+        if (from) {
+          // Extract email address for uniqueness
+          const emailMatch = from.match(/<(.+)>/);
+          const senderEmail = emailMatch ? emailMatch[1] : from;
+          const senderName = from.split('<')[0].trim().replace(/"/g, '') || senderEmail;
+
+          if (senderMap.has(senderEmail)) {
+            const existing = senderMap.get(senderEmail)!;
+            existing.count++;
+          } else {
+            senderMap.set(senderEmail, {
+              sender: senderName,
+              count: 1,
+            });
+          }
+        }
+      } catch (e) {
+        // Ignore errors for individual messages
+      }
+    };
+
+    await Promise.all(messages.map(chunkHelp));
+
+    // Convert to array and sort by count descending
+    const stats = Array.from(senderMap.entries()).map(([email, data]) => ({
+      email,
+      sender: data.sender,
+      count: data.count,
+    }));
+
+    stats.sort((a, b) => b.count - a.count);
+    return stats.slice(0, 20); // Return top 20
+  }
+
+  async listLargeEmails(minSizeMB: number = 10): Promise<(Email & { sizeEstimate: number })[]> {
+    const gmail = this.getGmailClient();
+
+    // Convert MB to bytes for Gmail query
+    const minSizeBytes = minSizeMB * 1024 * 1024;
+
+    // Search for emails larger than threshold
+    const response = await gmail.users.messages.list({
+      userId: 'me',
+      maxResults: 50,
+      q: `larger:${minSizeBytes}`,
+    });
+
+    const messages = response.data.messages || [];
+
+    // Fetch Labels for mapping
+    const labelsResponse = await gmail.users.labels.list({ userId: 'me' });
+    const labelMap = new Map<string, string>();
+    labelsResponse.data.labels?.forEach((l: any) => {
+      if (l.id && l.name) {
+        if (l.id === 'SPAM') labelMap.set(l.id, 'Spam');
+        else if (l.id === 'IMPORTANT') labelMap.set(l.id, 'Important');
+        else labelMap.set(l.id, l.name);
+      }
+    });
+
+    const chunkHelp = async (msg: any) => {
+      try {
+        const email = await gmail.users.messages.get({
+          userId: 'me',
+          id: msg.id!,
+        });
+
+        const headers = email.data.payload?.headers;
+        const subject = headers?.find((h) => h.name === 'Subject')?.value || '';
+        const from = headers?.find((h) => h.name === 'From')?.value || '';
+        const date = headers?.find((h) => h.name === 'Date')?.value || '';
+
+        const rawLabelIds = email.data.labelIds || [];
+        const humanLabels = rawLabelIds.map((id: string) => labelMap.get(id) || id);
+
+        return {
+          id: email.data.id!,
+          threadId: email.data.threadId!,
+          subject,
+          snippet: email.data.snippet || '',
+          from,
+          date,
+          labels: humanLabels,
+          sizeEstimate: email.data.sizeEstimate || 0,
+        };
+      } catch (e) {
+        return null;
+      }
+    };
+
+    const results = await Promise.all(messages.map(chunkHelp));
+    const validResults = results.filter((email): email is Email & { sizeEstimate: number } => email !== null);
+
+    // Sort by size descending
+    validResults.sort((a, b) => b.sizeEstimate - a.sizeEstimate);
+    return validResults;
+  }
+
+  async archiveEmail(emailId: string): Promise<void> {
+    const gmail = this.getGmailClient();
+
+    // Archive by removing INBOX label
+    await gmail.users.messages.modify({
+      userId: 'me',
+      id: emailId,
+      requestBody: {
+        removeLabelIds: ['INBOX']
+      }
+    });
+  }
+
+  async cleanStaleEmails(label: EmailLabel, olderThanDays: number): Promise<number> {
+    const gmail = this.getGmailClient();
+
+    // Calculate the date threshold
+    const thresholdDate = new Date();
+    thresholdDate.setDate(thresholdDate.getDate() - olderThanDays);
+    const afterTimestamp = Math.floor(thresholdDate.getTime() / 1000);
+
+    // Get label ID
+    const labelId = await this.getOrCreateLabelId(gmail, label);
+
+    // Search for old emails with this label
+    // Gmail query format: before:YYYY/MM/DD
+    const beforeDate = thresholdDate.toISOString().split('T')[0].replace(/-/g, '/');
+
+    let messages: any[] = [];
+    let pageToken = undefined;
+
+    do {
+      const response: any = await gmail.users.messages.list({
+        userId: 'me',
+        labelIds: [labelId],
+        q: `before:${beforeDate}`,
+        maxResults: 500,
+        pageToken: pageToken
+      });
+
+      if (response.data.messages) {
+        messages = messages.concat(response.data.messages);
+      }
+      pageToken = response.data.nextPageToken;
+    } while (pageToken);
+
+    if (messages.length === 0) return 0;
+
+    // Move to trash in batches
+    const batchSize = 1000;
+    for (let i = 0; i < messages.length; i += batchSize) {
+      const batch = messages.slice(i, i + batchSize).map((m: any) => m.id);
+      await gmail.users.messages.batchModify({
+        userId: 'me',
+        requestBody: {
+          ids: batch,
+          addLabelIds: ['TRASH']
+        }
+      });
+    }
+
+    return messages.length;
   }
 }

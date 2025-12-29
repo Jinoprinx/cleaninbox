@@ -9,3 +9,12 @@ export interface Email {
   date: string;
   labels: string[];
 }
+
+export interface Subscription {
+  id: string;
+  sender: string;
+  email: string;
+  unsubscribeLink?: string;
+  unsubscribeEmail?: string;
+  lastEmailDate: string;
+}
